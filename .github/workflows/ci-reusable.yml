@@ -46,24 +46,19 @@ jobs:
     container:
       image: ${{ matrix.image }}
 
-    continue-on-error: ${{ matrix.experimental }}
-
     strategy:
-      fail-fast: false
-
+      fail-fast: true
       matrix:
         go-version:
           - "1.25.x"
           - "1.26.x"
-
         distro:
           - ubuntu
           - amazon-linux
-
         include:
           - distro: ubuntu
             image: ubuntu:24.04
-
+            
           - distro: amazon-linux
             image: amazonlinux:2023
 
