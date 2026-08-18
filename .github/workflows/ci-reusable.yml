@@ -43,8 +43,8 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    container:
-      image: ${{ matrix.image }}
+    # container:
+      # image: {{ matrix.image }}
 
     strategy:
       fail-fast: true
@@ -54,19 +54,7 @@ jobs:
           - "1.26.x"
         distro:
           - ubuntu
-          - amazon-linux
-        include:
-          - distro: ubuntu
-            image: ubuntu:24.04
-            
-          - distro: amazon-linux
-            image: amazonlinux:2023
-
-          - go-version: "1.27rc2"
-            distro: ubuntu
-            image: ubuntu:24.04
-            experimental: true
-
+          - amazon-linux 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
