@@ -36,7 +36,6 @@ env:
   GOSEC_VERSION: "v2.25.0"
   TRIVY_VERSION: "v0.70.0"
 
-
 jobs:
   build-and-test:
     name: Build and Test | Go ${{ matrix.go-version }}
