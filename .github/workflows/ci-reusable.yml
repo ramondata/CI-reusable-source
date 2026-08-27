@@ -29,6 +29,11 @@ on:
         type: string
         default: "v1.0.0"
 
+    outputs:
+      image-tag:
+        description: Docker image tag
+        value: ${{ jobs.docker-build-push.outputs.image-tag }}
+
         
 env:
   GO_VERSION: "1.26.x"
@@ -208,6 +213,9 @@ jobs:
   docker-build-push:
     name: Docker Build / Scan / Push ECR
 
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.image-tag }}
+
     needs:
       - ci-success
 
@@ -235,12 +243,14 @@ jobs:
 
 
       - name: Generate Docker image tag
+        id: image-tag
         shell: bash
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           IMAGE_TAG="${APP_VERSION}-${SHORT_SHA}"
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "image-tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
           echo "Generated image tag: $IMAGE_TAG"
 
