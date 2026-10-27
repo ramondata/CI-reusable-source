@@ -43,3 +43,18 @@ Os outputs `image-tag` e `image-uri` informam a tag e o endereço completo da
 imagem publicada para consumidores GitOps. As verificações de Go, lint, SCA e
 SAST existentes são preservadas. O modo OIDC continua sendo o padrão para os
 demais consumidores.
+
+## Serviços Python
+
+O arquivo `.github/workflows/ci-python-reusable.yml` oferece o mesmo contrato
+AWS e os mesmos outputs do fluxo Go, usando Python 3.12, pytest, Ruff, Bandit
+e Trivy. A publicação permanece restrita à `aws-cloud-k8s`, por push ou execução
+manual. O modo Academy utiliza o mesmo parser de credenciais e a mesma
+configuração AWS já validada pelo auth-service.
+
+O input booleano `tests-required` é `true` por padrão. Consumidores sem testes
+existentes, como analytics-service, podem definir `false`: somente a ausência
+de testes (código 5 do pytest) vira aviso. Falhas de testes e de coleta continuam
+bloqueando o CI. A compilação sintática é sempre executada. As regras de Ruff,
+o gate alto/alta confiança do Bandit e os gates CRITICAL do Trivy são mantidos.
+O scan de imagem Python preserva `--ignore-unfixed` do workflow Python anterior.
