@@ -1,0 +1,409 @@
+name: Reusable Python CI
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: AWS region
+        required: true
+        type: string
+
+      aws-role-arn:
+        description: IAM Role used by GitHub OIDC
+        required: false
+        type: string
+
+      aws-auth-mode:
+        description: AWS authentication mode (oidc or academy)
+        required: false
+        type: string
+        default: "oidc"
+
+      tests-required:
+        description: Fail when pytest collects no tests
+        required: false
+        type: boolean
+        default: true
+
+      ecr-repository:
+        description: ECR repository
+        required: true
+        type: string
+
+      image-name:
+        description: Local Docker image name
+        required: true
+        type: string
+
+      app-version:
+        description: Application version
+        required: false
+        type: string
+        default: "v1.0.0"
+
+    secrets:
+      AWS_ACADEMY_CREDENTIALS:
+        description: AWS Academy credentials block (access key, secret key, session token)
+        required: false
+
+    outputs:
+      image-tag:
+        description: Docker image tag
+        value: ${{ jobs.docker-build-push.outputs.image-tag }}
+
+      image-uri:
+        description: Full ECR image URI, including registry, repository and tag
+        value: ${{ jobs.docker-build-push.outputs.image-uri }}
+
+        
+env:
+  PYTHON_VERSION: "3.12"
+  TRIVY_VERSION: "v0.70.0"
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        env:
+          TESTS_REQUIRED: ${{ inputs.tests-required }}
+        run: |
+          pip install pytest pytest-cov
+          python -m compileall -q app.py
+          set +e
+          pytest --cov=./ --cov-report=xml
+          TEST_STATUS=$?
+          set -e
+          if [ "$TEST_STATUS" -eq 5 ] && [ "$TESTS_REQUIRED" = "false" ]; then
+            echo "::warning::No pytest tests exist yet; Python syntax validation passed."
+            exit 0
+          fi
+          exit "$TEST_STATUS"
+
+  lint:
+    name: Linter / Static Analysis
+    needs: build-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install lint tools
+        run: pip install ruff
+
+      - name: Show required formatting changes
+        run: ruff format --diff .
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Run ruff lint
+        run: ruff check .
+
+  sca-trivy:
+    name: SCA / Trivy
+    needs:
+      - lint
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+      - name: Trivy full vulnerability report
+        run: |
+          trivy fs \
+            --scanners vuln \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --exit-code 0 \
+            .
+
+      - name: Trivy critical vulnerability quality gate
+        run: |
+          trivy fs \
+            --scanners vuln \
+            --severity CRITICAL \
+            --exit-code 1 \
+            .
+
+  sast-bandit:
+    name: SAST / Bandit
+    needs: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Bandit full report
+        run: bandit -r . -x ./tests --exit-zero
+
+      - name: Run bandit quality gate
+        run: bandit -r . -x ./tests -lll -iii
+
+  
+  ci-success:
+    name: CI Security Gate
+    if: ${{ always() }}
+    needs:
+      - build-and-test
+      - lint
+      - sca-trivy
+      - sast-bandit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify all required jobs
+        env:
+          BUILD_RESULT: ${{ needs.build-and-test.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          SCA_RESULT: ${{ needs.sca-trivy.result }}
+          SAST_RESULT: ${{ needs.sast-bandit.result }}
+        run: |
+          test "$BUILD_RESULT" = "success"
+          test "$LINT_RESULT" = "success"
+          test "$SCA_RESULT" = "success"
+          test "$SAST_RESULT" = "success"
+
+  # Não roda em Pull Request.
+  # Publicação somente em push ou execução manual na aws-cloud-k8s.
+  docker-build-push:
+    name: Docker Build / Scan / Push ECR
+
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.image-tag }}
+      image-uri: ${{ steps.ecr-image.outputs.image-uri }}
+
+    needs:
+      - ci-success
+
+    if: >
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/aws-cloud-k8s'
+
+    runs-on: ubuntu-latest
+
+    # Inherit caller permissions: OIDC callers grant id-token: write;
+    # Academy callers only need contents: read.
+
+    env:
+      AWS_REGION: ${{ inputs.aws-region }}
+      AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+      ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      APP_VERSION: ${{ inputs.app-version }}
+
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate AWS authentication mode
+        env:
+          AWS_AUTH_MODE: ${{ inputs.aws-auth-mode }}
+        run: |
+          case "$AWS_AUTH_MODE" in
+            academy) ;;
+            oidc)
+              if [ -z "$AWS_ROLE_ARN" ]; then
+                echo "::error::aws-role-arn is required for OIDC authentication."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::aws-auth-mode must be oidc or academy."
+              exit 1
+              ;;
+          esac
+
+      - name: Read AWS Academy credentials
+        if: inputs.aws-auth-mode == 'academy'
+        id: academy
+        shell: python
+        env:
+          AWS_ACADEMY_CREDENTIALS: ${{ secrets.AWS_ACADEMY_CREDENTIALS }}
+        run: |
+          import configparser
+          import os
+          import sys
+
+          raw = os.environ.get("AWS_ACADEMY_CREDENTIALS", "").strip().lstrip("\ufeff")
+          if not raw:
+              sys.exit("::error::Set the AWS_ACADEMY_CREDENTIALS repository secret with the current lab credentials.")
+
+          if not any(line.lstrip().startswith("[") for line in raw.splitlines()):
+              raw = "[default]\n" + raw
+
+          parser = configparser.ConfigParser(interpolation=None)
+          try:
+              parser.read_string(raw)
+          except configparser.Error:
+              sys.exit("::error::Invalid AWS Academy credentials format. Paste the AWS CLI credentials block.")
+
+          if parser.sections() != ["default"] or parser.defaults():
+              sys.exit("::error::AWS_ACADEMY_CREDENTIALS must contain only the [default] profile.")
+
+          fields = {
+              "aws-access-key-id": "aws_access_key_id",
+              "aws-secret-access-key": "aws_secret_access_key",
+              "aws-session-token": "aws_session_token",
+          }
+          credentials = {}
+          for output, key in fields.items():
+              value = parser.get("default", key, fallback="").strip()
+              if not value or any(char.isspace() for char in value):
+                  sys.exit(f"::error::Missing or invalid {key} in AWS_ACADEMY_CREDENTIALS.")
+              credentials[output] = value
+
+          for value in credentials.values():
+              print("::add-mask::" + value.replace("%", "%25"), flush=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:
+              for output, value in credentials.items():
+                  outputs.write(f"{output}={value}\n")
+
+      - name: Configure AWS Academy credentials
+        if: inputs.aws-auth-mode == 'academy'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ steps.academy.outputs.aws-access-key-id }}
+          aws-secret-access-key: ${{ steps.academy.outputs.aws-secret-access-key }}
+          aws-session-token: ${{ steps.academy.outputs.aws-session-token }}
+          aws-region: ${{ env.AWS_REGION }}
+          force-skip-oidc: true
+          unset-current-credentials: true
+          translate-env-variables: false
+
+      - name: Configure AWS credentials via OIDC
+        if: inputs.aws-auth-mode == 'oidc'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-${{ github.event.repository.name }}
+
+      - name: Verify AWS session and ECR repository
+        run: |
+          aws sts get-caller-identity --query Account --output text > /dev/null
+          aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$ECR_REPOSITORY" > /dev/null
+
+      - name: Generate Docker image tag
+        id: image-tag
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${APP_VERSION}-${SHORT_SHA}"
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "image-tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Generated image tag: $IMAGE_TAG"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "${IMAGE_NAME}:${IMAGE_TAG}" \
+            .
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+
+
+      - name: Trivy container vulnerability report
+        run: |
+          trivy image \
+            --scanners vuln \
+            --ignore-unfixed \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --exit-code 0 \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+
+      - name: Trivy critical vulnerability quality gate
+        run: |
+          trivy image \
+            --scanners vuln \
+            --ignore-unfixed \
+            --severity CRITICAL \
+            --exit-code 1 \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      - name: Tag image for Amazon ECR
+        id: ecr-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+
+        run: |
+          ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          docker tag \
+            "${IMAGE_NAME}:${IMAGE_TAG}" \
+            "$ECR_IMAGE"
+
+          echo "ECR_IMAGE=$ECR_IMAGE" >> "$GITHUB_ENV"
+          echo "image-uri=$ECR_IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "ECR image: $ECR_IMAGE"
+
+
+      - name: Push Docker image to Amazon ECR
+        run: |
+          docker push "$ECR_IMAGE"
+
+
+      - name: Docker image summary
+        run: |
+          echo "### Docker image published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$ECR_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
